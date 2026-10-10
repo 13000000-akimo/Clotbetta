@@ -1,0 +1,1926 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Уборщик">
+<meta name="theme-color" content="#000000">
+<title>Уборщик</title>
+<link rel="manifest" href="data:application/manifest+json,%7B%22name%22%3A%22%D0%A3%D0%B1%D0%BE%D1%80%D1%89%D0%B8%D0%BA%22%2C%22short_name%22%3A%22Cleaner%22%2C%22start_url%22%3A%22.%2F%22%2C%22display%22%3A%22fullscreen%22%2C%22orientation%22%3A%22portrait%22%2C%22background_color%22%3A%22%23000000%22%2C%22theme_color%22%3A%22%23000000%22%2C%22icons%22%3A%5B%7B%22src%22%3A%22data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII%3D%22%2C%22sizes%22%3A%22192x192%22%2C%22type%22%3A%22image%2Fpng%22%7D%5D%7D">
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#000;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+    font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;
+    color:#eee;touch-action:none;}
+  #game{display:block;width:100vw;height:100vh;touch-action:none;}
+  #ui{position:fixed;inset:0;pointer-events:none;}
+  .hidden{display:none!important;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui"></div>
+
+<script type="module">
+'use strict';
+
+/* ============================================================
+ *  УТИЛИТЫ
+ * ============================================================ */
+const clamp = (v,a,b)=>v<a?a:v>b?b:v;
+const dist2 = (ax,ay,bx,by)=>{const dx=ax-bx,dy=ay-by;return dx*dx+dy*dy;};
+const rand = (a,b)=>a+Math.random()*(b-a);
+const lerp = (a,b,t)=>a+(b-a)*t;
+
+/* ============================================================
+ *  АУДИО — процедурные звуки через Web Audio API
+ * ============================================================ */
+class AudioManager {
+  constructor(){
+    this.ctx = null;
+    this.master = null;
+    this.enabled = true;
+  }
+  init(){
+    if(this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.35;
+    this.master.connect(this.ctx.destination);
+  }
+  resume(){ if(this.ctx && this.ctx.state==='suspended') this.ctx.resume(); }
+  _env(node, t0, attack, decay, peak=0.5){
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0+attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0+attack+decay);
+    node.connect(g); g.connect(this.master);
+    return g;
+  }
+  // Шаги: короткий "шумовой" тап
+  step(){
+    if(!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type='triangle'; o.frequency.setValueAtTime(rand(80,120), t);
+    o.frequency.exponentialRampToValueAtTime(50, t+0.08);
+    this._env(o, t, 0.005, 0.09, 0.25);
+    o.start(t); o.stop(t+0.15);
+  }
+  // Швабра: шипящий шум
+  mop(){
+    if(!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const len = Math.floor(this.ctx.sampleRate*0.25);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i] = (Math.random()*2-1) * (1 - i/len);
+    const src = this.ctx.createBufferSource(); src.buffer = buf;
+    const f = this.ctx.createBiquadFilter(); f.type='bandpass'; f.frequency.value=1800; f.Q.value=0.8;
+    src.connect(f); this._env(f, t, 0.01, 0.25, 0.5);
+    src.start(t);
+  }
+  // Вода
+  water(){
+    if(!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type='sine'; o.frequency.setValueAtTime(400, t);
+    o.frequency.exponentialRampToValueAtTime(900, t+0.4);
+    this._env(o, t, 0.05, 0.4, 0.3);
+    o.start(t); o.stop(t+0.5);
+  }
+  // Щелчок фото
+  shutter(){
+    if(!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type='square'; o.frequency.setValueAtTime(2000, t);
+    o.frequency.exponentialRampToValueAtTime(300, t+0.05);
+    this._env(o, t, 0.001, 0.06, 0.4);
+    o.start(t); o.stop(t+0.08);
+  }
+  // Писк крысы
+  ratSqueak(){
+    if(!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type='sawtooth';
+    o.frequency.setValueAtTime(1800, t);
+    o.frequency.exponentialRampToValueAtTime(3200, t+0.05);
+    o.frequency.exponentialRampToValueAtTime(1500, t+0.12);
+    this._env(o, t, 0.005, 0.13, 0.35);
+    o.start(t); o.stop(t+0.15);
+  }
+  // Упаковка
+  bagRustle(){
+    if(!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const len = Math.floor(this.ctx.sampleRate*0.4);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for(let i=0;i<len;i++){
+      // Периодические "шуршания"
+      const env = Math.sin(i/len*Math.PI*6)**2;
+      d[i] = (Math.random()*2-1) * env * 0.5;
+    }
+    const src = this.ctx.createBufferSource(); src.buffer = buf;
+    const f = this.ctx.createBiquadFilter(); f.type='highpass'; f.frequency.value=2000;
+    src.connect(f); this._env(f, t, 0.01, 0.4, 0.4);
+    src.start(t);
+  }
+  // Клик UI
+  uiClick(){
+    if(!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type='sine'; o.frequency.value = 880;
+    this._env(o, t, 0.002, 0.05, 0.25);
+    o.start(t); o.stop(t+0.07);
+  }
+  // Добор воды
+  fillWater(){ this.water(); }
+}
+
+/* ============================================================
+ *  ВВОД — тач
+ * ============================================================ */
+class Input {
+  constructor(canvas){
+    this.canvas = canvas;
+    this.touches = new Map(); // id -> {x,y,startX,startY,startT}
+    this.joy = { active:false, id:null, cx:0, cy:0, x:0, y:0, dx:0, dy:0, radius:70 };
+    this.actionBtn = { active:false, id:null, x:0, y:0, r:52, pressed:false };
+    this.invBtns = []; // {id, x,y,w,h, index}
+    this.uiHit = []; // внешние тач-зоны (кнопки)
+    this.onUIPress = null; // callback(x,y) -> true если обработано
+    this.bind();
+  }
+  bind(){
+    const c = this.canvas;
+    const opts = { passive:false };
+    c.addEventListener('touchstart', e=>this.start(e), opts);
+    c.addEventListener('touchmove',  e=>this.move(e), opts);
+    c.addEventListener('touchend',   e=>this.end(e), opts);
+    c.addEventListener('touchcancel',e=>this.end(e), opts);
+    // На десктопе — мышка как 1 палец (для отладки)
+    c.addEventListener('mousedown', e=>this._mouse(e,'start'));
+    c.addEventListener('mousemove', e=>this._mouse(e,'move'));
+    c.addEventListener('mouseup',   e=>this._mouse(e,'end'));
+  }
+  _mouse(e, type){
+    const t = { identifier:'mouse', clientX:e.clientX, clientY:e.clientY };
+    const fake = { touches:[t], changedTouches:[t], preventDefault(){}, _fake:true };
+    if(type==='start') this.start(fake);
+    else if(type==='move') this.move(fake);
+    else this.end(fake);
+  }
+  start(e){
+    e.preventDefault();
+    const rect = this.canvas.getBoundingClientRect();
+    for(const t of e.changedTouches){
+      const x = t.clientX - rect.left;
+      const y = t.clientY - rect.top;
+      // 1) UI кнопки (инвентарь, action) — приоритетнее
+      if(this.onUIPress && this.onUIPress(x,y)){
+        this.touches.set(t.identifier,{x,y,startX:x,startY:y,startT:performance.now(),ui:true});
+        continue;
+      }
+      // 2) Если в левой половине и не занят джойстик — это джойстик
+      if(!this.joy.active && x < rect.width*0.55){
+        this.joy.active = true;
+        this.joy.id = t.identifier;
+        this.joy.cx = x; this.joy.cy = y;
+        this.joy.x = x; this.joy.y = y;
+        this.joy.dx = 0; this.joy.dy = 0;
+      }
+      this.touches.set(t.identifier,{x,y,startX:x,startY:y,startT:performance.now(),ui:false});
+    }
+  }
+  move(e){
+    e.preventDefault();
+    const rect = this.canvas.getBoundingClientRect();
+    for(const t of e.changedTouches){
+      const rec = this.touches.get(t.identifier);
+      if(!rec) continue;
+      rec.x = t.clientX - rect.left;
+      rec.y = t.clientY - rect.top;
+      if(this.joy.active && this.joy.id === t.identifier){
+        let dx = rec.x - this.joy.cx;
+        let dy = rec.y - this.joy.cy;
+        const len = Math.hypot(dx,dy);
+        const R = this.joy.radius;
+        if(len > R){ dx = dx/len*R; dy = dy/len*R; }
+        this.joy.x = this.joy.cx + dx;
+        this.joy.y = this.joy.cy + dy;
+        this.joy.dx = dx / R;
+        this.joy.dy = dy / R;
+      }
+    }
+  }
+  end(e){
+    e.preventDefault();
+    for(const t of e.changedTouches){
+      const rec = this.touches.get(t.identifier);
+      this.touches.delete(t.identifier);
+      if(this.joy.active && this.joy.id === t.identifier){
+        this.joy.active = false;
+        this.joy.id = null;
+        this.joy.dx = 0; this.joy.dy = 0;
+      }
+    }
+  }
+  isLongPress(id, ms){
+    const rec = this.touches.get(id);
+    if(!rec) return false;
+    return performance.now() - rec.startT > ms;
+  }
+}
+
+/* ============================================================
+ *  БАЗОВЫЕ СУЩНОСТИ
+ * ============================================================ */
+class Rect {
+  constructor(x,y,w,h){ this.x=x; this.y=y; this.w=w; this.h=h; }
+  intersects(o){ return this.x < o.x+o.w && this.x+this.w > o.x && this.y < o.y+o.h && this.y+this.h > o.y; }
+  contains(px,py){ return px>=this.x && px<=this.x+this.w && py>=this.y && py<=this.y+this.h; }
+  center(){ return {x:this.x+this.w/2, y:this.y+this.h/2}; }
+}
+
+/* ============================================================
+ *  КАРТА МИРА
+ * ============================================================ */
+class WorldMap {
+  constructor(){
+    this.width = 1200;
+    this.height = 1600;
+    this.obstacles = [];
+    this.waterSources = [];
+    this.bottles = [];
+    this.exits = [];
+    this.darkZones = []; // зоны тьмы (места без света)
+    this.buildApartment();
+  }
+  buildApartment(){
+    const W = this.width, H = this.height;
+    const t = 16; // толщина стен
+
+    // Внешние стены
+    this.obstacles.push(new Rect(0,0,W,t));
+    this.obstacles.push(new Rect(0,H-t,W,t));
+    this.obstacles.push(new Rect(0,0,t,H));
+    this.obstacles.push(new Rect(W-t,0,t,H));
+
+    // Внутренняя планировка: 2x2 сетка комнат + коридор
+    const midX = W/2;
+    const midY = H/2;
+    const doorW = 100;
+
+    // Горизонтальная стена по середине (с проходом в центре)
+    this.obstacles.push(new Rect(t, midY, midX - t - doorW/2, t));
+    this.obstacles.push(new Rect(midX + doorW/2, midY, W - t - (midX + doorW/2), t));
+
+    // Вертикальная стена (с проходом сверху и снизу)
+    const vy1 = t + 200;
+    const vy2 = H - t - 200;
+    this.obstacles.push(new Rect(midX, t, t, vy1 - t));
+    this.obstacles.push(new Rect(midX, vy1 + doorW, t, vy2 - (vy1+doorW)));
+    this.obstacles.push(new Rect(midX, vy2 + doorW, t, H - t - (vy2+doorW)));
+
+    // ---- Комната 1 (верх-лево): спальня ----
+    this.obstacles.push(new Rect(60, 60, 220, 90));    // кровать
+    this.obstacles.push(new Rect(320, 60, 80, 80));    // тумбочка
+    this.obstacles.push(new Rect(60, 220, 60, 200));   // шкаф
+    this.obstacles.push(new Rect(400, 200, 150, 60));  // комод
+
+    // ---- Комната 2 (верх-право): ванная ----
+    const wx = midX + t;
+    this.obstacles.push(new Rect(wx + 40, 60, 200, 100));  // ванна
+    this.waterSources.push(new Rect(wx + 40, 60, 200, 100).center && {x:wx+140, y:110, r:40, type:'bath'});
+    this.obstacles.push(new Rect(wx + 280, 60, 100, 60));  // раковина
+    this.waterSources.push({x: wx + 330, y: 90, r:35, type:'sink'});
+    this.obstacles.push(new Rect(wx + 40, 220, 60, 200)); // унитаз
+    this.waterSources.push({x: wx + 70, y: 320, r:30, type:'toilet'});
+
+    // Бутылки с моющими средствами
+    this.bottles.push({x: wx+200, y:200, taken:false});
+    this.bottles.push({x: 200, y: 500, taken:false});
+
+    // ---- Комната 3 (низ-лево): гостиная ----
+    this.obstacles.push(new Rect(60, midY + 60, 260, 120));  // диван
+    this.obstacles.push(new Rect(60, midY + 240, 180, 80));  // журнальный столик
+    this.obstacles.push(new Rect(320, midY + 200, 120, 80)); // ТВ-тумба
+
+    // ---- Комната 4 (низ-право): кухня ----
+    const kx = midX + t;
+    this.obstacles.push(new Rect(kx + 40, midY + 60, 260, 80)); // стол
+    this.obstacles.push(new Rect(kx + 40, midY + 220, 80, 180)); // кухонный гарнитур
+    this.waterSources.push({x: kx + 90, y: midY + 250, r:35, type:'sink'});
+
+    // Стопка мешков для трупов (стартовый запас) — в прихожей возле выхода
+    this.bagStack = {x: W/2, y: H - 120, count: 8};
+
+    // Выход/машина
+    this.exits.push(new Rect(W/2 - 60, H - 80, 120, 60));
+  }
+  // Проверка коллизии прямоугольника с миром
+  collides(r){
+    for(const o of this.obstacles) if(r.intersects(o)) return o;
+    return null;
+  }
+  // Найти источник воды рядом с точкой
+  waterSourceNear(x,y,r=50){
+    for(const w of this.waterSources){
+      if(dist2(x,y,w.x,w.y) < (r+w.r)*(r+w.r)) return w;
+    }
+    return null;
+  }
+  exitNear(x,y,r=60){
+    for(const e of this.exits){
+      const c = e.center();
+      if(dist2(x,y,c.x,c.y) < r*r) return e;
+    }
+    return null;
+  }
+}
+
+/* ============================================================
+ *  ПЯТНА КРОВИ
+ * ============================================================ */
+class BloodStain {
+  constructor(x,y,type='floor',size=30){
+    this.x=x; this.y=y;
+    this.type = type; // 'floor' | 'wall'
+    this.size = size;
+    this.clean = 0; // 0..1 — прогресс очистки
+    this.rot = rand(0,Math.PI*2);
+  }
+  draw(ctx){
+    const a = 1 - this.clean;
+    if(a <= 0.01) return;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.rot);
+    ctx.globalAlpha = a * 0.85;
+    ctx.fillStyle = '#6a0000';
+    ctx.beginPath();
+    // Неровное пятно
+    const pts = 10;
+    for(let i=0;i<pts;i++){
+      const ang = i/pts*Math.PI*2;
+      const r = this.size * (0.6 + 0.4*Math.sin(i*7.13 + this.rot));
+      const px = Math.cos(ang)*r, py = Math.sin(ang)*r;
+      if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    // Тёмный центр
+    ctx.globalAlpha = a * 0.6;
+    ctx.fillStyle = '#3a0000';
+    ctx.beginPath();
+    ctx.arc(0,0,this.size*0.4,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+/* ============================================================
+ *  ТЕЛО
+ * ============================================================ */
+const BodyState = {
+  RAW: 'raw',               // сырое тело на полу
+  PHOTOGRAPHED: 'photo',    // сфотографировано
+  BAGGED: 'bagged',         // упаковано в мешок
+  CARRIED: 'carried',       // в руках
+  DELIVERED: 'delivered'    // сдано
+};
+
+class Body {
+  constructor(x,y,onSurface=false){
+    this.x=x; this.y=y;
+    this.w=28; this.h=44;
+    this.state = BodyState.RAW;
+    this.onSurface = onSurface; // лежит на кровати/диване
+    this.packProgress = 0;      // 0..1 прогресс упаковки
+    this.photoId = null;
+    this.bloodUnder = [];
+    // Начальные пятна крови вокруг
+    for(let i=0;i<6;i++){
+      const a = rand(0,Math.PI*2), r = rand(10,45);
+      this.bloodUnder.push(new BloodStain(x+Math.cos(a)*r, y+Math.sin(a)*r, 'floor', rand(15,35)));
+    }
+  }
+  get rect(){ return new Rect(this.x-this.w/2, this.y-this.h/2, this.w, this.h); }
+  draw(ctx, game){
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    if(this.state === BodyState.RAW || this.state === BodyState.PHOTOGRAPHED){
+      // Тело: тёмный силуэт в позе
+      ctx.fillStyle = '#2a1a1a';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, this.w*0.5, this.h*0.5, 0, 0, Math.PI*2);
+      ctx.fill();
+      // Голова
+      ctx.fillStyle = '#1a0f0f';
+      ctx.beginPath();
+      ctx.arc(0, -this.h*0.35, 8, 0, Math.PI*2);
+      ctx.fill();
+      // Кровь под телом
+      ctx.fillStyle = 'rgba(120,0,0,0.5)';
+      ctx.beginPath();
+      ctx.ellipse(0, 6, this.w*0.7, this.h*0.5, 0, 0, Math.PI*2);
+      ctx.fill();
+      if(this.state === BodyState.PHOTOGRAPHED){
+        // Метка "сфотографировано"
+        ctx.fillStyle = '#4ade80';
+        ctx.font = 'bold 14px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('📷', 0, -this.h*0.5 - 6);
+      }
+    } else if(this.state === BodyState.BAGGED || this.state === BodyState.CARRIED){
+      // Серый мешок
+      ctx.fillStyle = '#666';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, this.w*0.55, this.h*0.5, 0, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = '#444';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // Завязка сверху
+      ctx.strokeStyle = '#333';
+      ctx.beginPath();
+      ctx.moveTo(-8, -this.h*0.45);
+      ctx.lineTo(8, -this.h*0.45);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+/* ============================================================
+ *  КРЫСА
+ * ============================================================ */
+class Rat {
+  constructor(x,y){
+    this.x=x; this.y=y;
+    this.w=14; this.h=10;
+    this.vx=0; this.vy=0;
+    this.speed = rand(40,70);
+    this.dirTimer = rand(0.5, 2);
+    this.squeakCd = 0;
+    this.alive = true;
+  }
+  get rect(){ return new Rect(this.x-this.w/2, this.y-this.h/2, this.w, this.h); }
+  update(dt, world){
+    this.dirTimer -= dt;
+    if(this.dirTimer <= 0){
+      const a = rand(0,Math.PI*2);
+      this.vx = Math.cos(a)*this.speed;
+      this.vy = Math.sin(a)*this.speed;
+      this.dirTimer = rand(0.5, 2);
+    }
+    // Пробуем сдвинуться по X, потом Y (скольжение)
+    const nx = this.x + this.vx*dt;
+    const ny = this.y + this.vy*dt;
+    const testX = new Rect(nx - this.w/2, this.y - this.h/2, this.w, this.h);
+    if(!world.collides(testX)) this.x = nx;
+    else { this.vx = -this.vx; this.dirTimer = rand(0.3,0.8); }
+    const testY = new Rect(this.x - this.w/2, ny - this.h/2, this.w, this.h);
+    if(!world.collides(testY)) this.y = ny;
+    else { this.vy = -this.vy; this.dirTimer = rand(0.3,0.8); }
+    if(this.squeakCd > 0) this.squeakCd -= dt;
+  }
+  draw(ctx){
+    if(!this.alive) return;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    const ang = Math.atan2(this.vy, this.vx);
+    ctx.rotate(ang);
+    // Тело
+    ctx.fillStyle = '#4a4a4a';
+    ctx.beginPath();
+    ctx.ellipse(0,0,this.w*0.5, this.h*0.5, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Хвост
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-this.w*0.5, 0);
+    ctx.quadraticCurveTo(-this.w*0.9, Math.sin(performance.now()/200)*3, -this.w*1.2, 0);
+    ctx.stroke();
+    // Глаз
+    ctx.fillStyle = '#ff4444';
+    ctx.beginPath();
+    ctx.arc(this.w*0.25, -2, 1.5, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+/* ============================================================
+ *  ВЕДРО
+ * ============================================================ */
+class Bucket {
+  constructor(){
+    this.capacity = 1.0;
+    this.water = 0;        // 0..1
+    this.dirt = 0;         // 0..1
+    this.soap = 0;         // 0..1
+  }
+  get isWet(){ return this.water > 0.05; }
+  get isTooDirty(){ return this.dirt > 0.7; }
+  get cleanPower(){
+    if(!this.isWet) return 0;
+    let p = (1 - this.dirt*0.9);
+    p += this.soap * 0.6;
+    return clamp(p, 0, 1.4);
+  }
+  fill(){ this.water = this.capacity; this.dirt = 0; }
+  addSoap(){ this.soap = clamp(this.soap + 0.5, 0, 1); }
+  addDirt(amount){ this.dirt = clamp(this.dirt + amount, 0, 1); }
+  useWater(amount){
+    this.water = clamp(this.water - amount, 0, 1);
+    if(this.water < 0.02){ this.water = 0; this.dirt = 0; this.soap = 0; }
+  }
+  empty(){ this.water = 0; this.dirt = 0; this.soap = 0; }
+  draw(ctx, x, y, scale=1){
+    ctx.save();
+    ctx.translate(x,y);
+    ctx.scale(scale,scale);
+    ctx.fillStyle = '#4a5568';
+    ctx.beginPath();
+    ctx.moveTo(-14,-10); ctx.lineTo(14,-10); ctx.lineTo(11,14); ctx.lineTo(-11,14);
+    ctx.closePath();
+    ctx.fill();
+    // Вода
+    if(this.water > 0){
+      const waterColor = this.dirt > 0.5 ? '#5a1a1a' : (this.soap > 0.3 ? '#7fd4e8' : '#4a90c8');
+      ctx.fillStyle = waterColor;
+      const wh = 20 * this.water;
+      ctx.fillRect(-12, 14 - wh, 24, wh);
+    }
+    // Ручка
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, -10, 14, Math.PI, 0);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ============================================================
+ *  ИГРОК
+ * ============================================================ */
+class Player {
+  constructor(x,y){
+    this.x=x; this.y=y;
+    this.w=24; this.h=32;
+    this.speed = 160;
+    this.vx=0; this.vy=0;
+    this.dir = 'down';
+    this.animT = 0;
+    this.stepTimer = 0;
+    // Инвентарь
+    this.tool = 'hands';   // 'hands'|'mop'|'sponge'|'phone'|'bucket'
+    this.carryingBody = null;
+    this.bags = 0;
+    this.hasBucket = false;
+    this.bucket = new Bucket();
+    this.hasSponge = true;
+    this.hasMop = true;
+    this.hasPhone = true;
+  }
+  get rect(){ return new Rect(this.x-this.w/2, this.y-this.h/2, this.w, this.h); }
+  update(dt, input, world, game){
+    // Управление с джойстика
+    let dx = 0, dy = 0;
+    if(input.joy.active){
+      dx = input.joy.dx; dy = input.joy.dy;
+      const len = Math.hypot(dx,dy);
+      if(len > 1){ dx/=len; dy/=len; }
+      if(len < 0.15){ dx=0; dy=0; }
+    }
+    // Клавиатура (для отладки на десктопе)
+    if(game.keys){
+      if(game.keys.has('w') || game.keys.has('ArrowUp')) dy -= 1;
+      if(game.keys.has('s') || game.keys.has('ArrowDown')) dy += 1;
+      if(game.keys.has('a') || game.keys.has('ArrowLeft')) dx -= 1;
+      if(game.keys.has('d') || game.keys.has('ArrowRight')) dx += 1;
+    }
+    const mag = Math.hypot(dx,dy);
+    if(mag > 1){ dx/=mag; dy/=mag; }
+    this.vx = dx * this.speed;
+    this.vy = dy * this.speed;
+
+    // Движение с коллизиями по осям
+    const nx = this.x + this.vx*dt;
+    const testX = new Rect(nx - this.w/2, this.y - this.h/2, this.w, this.h);
+    if(!world.collides(testX)) this.x = nx;
+    const ny = this.y + this.vy*dt;
+    const testY = new Rect(this.x - this.w/2, ny - this.h/2, this.w, this.h);
+    if(!world.collides(testY)) this.y = ny;
+
+    // Анимация шагов
+    const moving = mag > 0.15;
+    if(moving){
+      this.animT += dt * 8;
+      this.stepTimer -= dt;
+      if(this.stepTimer <= 0){
+        game.audio.step();
+        this.stepTimer = 0.35;
+      }
+      if(Math.abs(dx) > Math.abs(dy)) this.dir = dx>0 ? 'right' : 'left';
+      else this.dir = dy>0 ? 'down' : 'up';
+    } else {
+      this.animT = 0;
+    }
+
+    // Проверка на крыс
+    for(const rat of game.rats){
+      if(!rat.alive) continue;
+      if(this.rect.intersects(rat.rect)){
+        if(rat.squeakCd <= 0){
+          game.audio.ratSqueak();
+          rat.squeakCd = 1.0;
+          game.toast('🐀 Писк!');
+          // Крыса убегает
+          const ex = rat.x - this.x, ey = rat.y - this.y;
+          const l = Math.hypot(ex,ey)||1;
+          rat.vx = ex/l*200; rat.vy = ey/l*200;
+          rat.dirTimer = 0.6;
+        }
+      }
+    }
+  }
+  draw(ctx){
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    // Тень
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(0, this.h*0.4, this.w*0.6, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Тело
+    const bob = Math.sin(this.animT)*2;
+    ctx.fillStyle = '#3b82f6';
+    ctx.beginPath();
+    ctx.ellipse(0, bob*0.3, this.w*0.5, this.h*0.5, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Голова
+    ctx.fillStyle = '#f5c6a0';
+    ctx.beginPath();
+    ctx.arc(0, -this.h*0.35 + bob*0.3, 7, 0, Math.PI*2);
+    ctx.fill();
+    // Фонарик (направление взгляда)
+    const dirAng = {right:0, down:Math.PI/2, left:Math.PI, up:-Math.PI/2}[this.dir];
+    ctx.save();
+    ctx.rotate(dirAng);
+    ctx.fillStyle = '#ffe066';
+    ctx.beginPath();
+    ctx.arc(8, 0, 3, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+    // Если несёт тело — рисуем над головой
+    if(this.carryingBody){
+      ctx.fillStyle = '#666';
+      ctx.beginPath();
+      ctx.ellipse(0, -this.h*0.9, 14, 18, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+/* ============================================================
+ *  HUD — рисует джойстик, кнопки, прогресс-бар
+ * ============================================================ */
+class HUD {
+  constructor(game){
+    this.game = game;
+    this.toasts = []; // {text, t}
+    this.actionHint = '';
+    this.showHintT = 0;
+  }
+  toast(text){
+    this.toasts.push({text, t:1.6});
+    if(this.toasts.length > 3) this.toasts.shift();
+  }
+  update(dt){
+    for(let i=this.toasts.length-1;i>=0;i--){
+      this.toasts[i].t -= dt;
+      if(this.toasts[i].t <= 0) this.toasts.splice(i,1);
+    }
+    if(this.showHintT > 0) this.showHintT -= dt;
+  }
+  draw(ctx, W, H, input, game){
+    // --- Джойстик ---
+    if(input.joy.active){
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(input.joy.cx, input.joy.cy, input.joy.radius, 0, Math.PI*2);
+      ctx.stroke();
+      ctx.globalAlpha = 0.6;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      ctx.arc(input.joy.x, input.joy.y, 28, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // --- Кнопка действия справа ---
+    const btnX = W - 90, btnY = H - 130;
+    ctx.save();
+    ctx.globalAlpha = 0.8;
+    ctx.fillStyle = game.actionReady ? '#22c55e' : '#4b5563';
+    ctx.beginPath();
+    ctx.arc(btnX, btnY, 50, 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(game.actionLabel || 'ДЕЙСТВИЕ', btnX, btnY);
+    ctx.restore();
+
+    // --- Инвентарь внизу ---
+    const tools = [
+      {id:'hands', label:'✋'},
+      {id:'mop',   label:'🧹'},
+      {id:'sponge',label:'🧽'},
+      {id:'phone', label:'📷'},
+    ];
+    const invY = H - 60;
+    const totalW = tools.length * 62;
+    const startX = 20;
+    for(let i=0;i<tools.length;i++){
+      const tx = startX + i*62;
+      const selected = game.player.tool === tools[i].id;
+      ctx.save();
+      ctx.fillStyle = selected ? '#3b82f6' : 'rgba(30,41,59,0.85)';
+      ctx.beginPath();
+      ctx.roundRect(tx, invY - 26, 56, 52, 10);
+      ctx.fill();
+      ctx.strokeStyle = selected ? '#93c5fd' : '#334155';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.font = '26px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(tools[i].label, tx+28, invY);
+      ctx.restore();
+    }
+
+    // --- Время смены ---
+    const totalShift = game.shiftDuration;
+    const elapsed = game.shiftTime;
+    const mins = Math.floor(elapsed/60);
+    const secs = Math.floor(elapsed%60);
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.beginPath();
+    ctx.roundRect(W-140, 20, 120, 60, 8);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`, W-80, 42);
+    ctx.font = '11px sans-serif';
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('СМЕНА', W-80, 66);
+    ctx.restore();
+
+    // --- Список жертв ---
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.beginPath();
+    ctx.roundRect(20, 20, 120, 30 + game.bodies.filter(b=>b.photoId).length*22, 8);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`📋 Жертвы`, 30, 28);
+    let y = 48;
+    for(const b of game.bodies){
+      if(b.photoId){
+        ctx.fillStyle = b.state === BodyState.DELIVERED ? '#4ade80' : '#fbbf24';
+        ctx.fillText(`#${b.photoId} ${b.state === BodyState.DELIVERED ? '✓' : '…'}`, 30, y);
+        y += 22;
+      }
+    }
+    ctx.restore();
+
+    // --- Инфо о ведре (если в руках или выбран инструмент) ---
+    if(game.player.tool === 'mop' || game.player.tool === 'sponge' || game.player.hasBucket){
+      const bx = 20, by = H - 130;
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.65)';
+      ctx.beginPath();
+      ctx.roundRect(bx, by, 150, 60, 8);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.font = '12px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      // Шкала воды
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText('Вода:', bx+10, by+8);
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(bx+55, by+8, 80, 8);
+      ctx.fillStyle = '#4a90c8';
+      ctx.fillRect(bx+55, by+8, 80*game.player.bucket.water, 8);
+      // Шкала грязи
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText('Грязь:', bx+10, by+24);
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(bx+55, by+24, 80, 8);
+      ctx.fillStyle = '#a01818';
+      ctx.fillRect(bx+55, by+24, 80*game.player.bucket.dirt, 8);
+      // Мыло
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText('Мыло:', bx+10, by+40);
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(bx+55, by+40, 80, 8);
+      ctx.fillStyle = '#7fd4e8';
+      ctx.fillRect(bx+55, by+40, 80*game.player.bucket.soap, 8);
+      ctx.restore();
+    }
+
+    // --- Мешки ---
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.beginPath();
+    ctx.roundRect(W-140, 90, 120, 34, 8);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`🛍️ Мешки: ${game.player.bags}`, W-80, 107);
+    ctx.restore();
+
+    // --- Прогресс-бар упаковки ---
+    if(game.packTarget && game.packProgress > 0){
+      const t = game.packTarget;
+      const bw = 100, bh = 12;
+      const bx = W/2 - bw/2, by = H/2 + 100;
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      ctx.beginPath();
+      ctx.roundRect(bx-5, by-5, bw+10, bh+10, 6);
+      ctx.fill();
+      ctx.fillStyle = '#334155';
+      ctx.fillRect(bx, by, bw, bh);
+      ctx.fillStyle = '#22c55e';
+      ctx.fillRect(bx, by, bw*game.packProgress, bh);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('УПАКОВКА…', W/2, by-8);
+      ctx.restore();
+    }
+
+    // --- Тост-сообщения ---
+    let toastY = 120;
+    ctx.save();
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for(const t of this.toasts){
+      const a = clamp(t.t, 0, 1);
+      ctx.globalAlpha = a;
+      const tw = ctx.measureText(t.text).width + 24;
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      ctx.beginPath();
+      ctx.roundRect(W/2 - tw/2, toastY - 14, tw, 28, 14);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.fillText(t.text, W/2, toastY);
+      toastY += 34;
+    }
+    ctx.restore();
+
+    // --- Подсказка контекста ---
+    if(game.contextHint){
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      const tw = ctx.measureText(game.contextHint).width + 30;
+      ctx.beginPath();
+      ctx.roundRect(W/2 - tw/2, H-200, tw, 30, 15);
+      ctx.fill();
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(game.contextHint, W/2, H-185);
+      ctx.restore();
+    }
+  }
+}
+
+/* ============================================================
+ *  ГЛАВНЫЙ КЛАСС ИГРЫ
+ * ============================================================ */
+class Game {
+  constructor(canvas){
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.input = new Input(canvas);
+    this.audio = new AudioManager();
+    this.world = new WorldMap();
+    this.player = new Player(this.world.width/2, this.world.height - 200);
+    this.player.bags = this.world.bagStack.count;
+    this.bodies = [];
+    this.rats = [];
+    this.bloodStains = [];
+    this.hud = new HUD(this);
+    this.state = 'MENU';
+    this.keys = new Set();
+    this.shiftDuration = 15*60; // 15 минут смена
+    this.shiftTime = 0;
+    this.actionReady = false;
+    this.actionLabel = '';
+    this.actionTarget = null;
+    this.packTarget = null;
+    this.packProgress = 0;
+    this.lastDT = 0;
+    this._acc = 0;
+    this.camera = {x:0, y:0};
+    this.toastText = '';
+    this.toastT = 0;
+    this.contextHint = '';
+    this.photoCounter = 0;
+    this.deliveredBodies = 0;
+    this.stationProgress = 0; // для мини-игры участка
+    this._spawnEntities();
+    this._bindInput();
+    this._bindKeyboard();
+    this._save = null;
+    // Размер
+    this._resize();
+    window.addEventListener('resize', ()=>this._resize());
+    window.addEventListener('orientationchange', ()=>setTimeout(()=>this._resize(), 200));
+    // Запуск цикла
+    this._lastTime = performance.now();
+    this._raf = null;
+    this._loop = this._loop.bind(this);
+    this._raf = requestAnimationFrame(this._loop);
+  }
+
+  _spawnEntities(){
+    // Тела
+    const W = this.world.width, H = this.world.height;
+    // 1) На полу гостиной
+    const b1 = new Body(W*0.28, H*0.62, false);
+    this.bodies.push(b1);
+    this.bloodStains.push(...b1.bloodUnder);
+
+    // 2) На кровати (нужно снять)
+    const b2 = new Body(160, 120, true);
+    this.bodies.push(b2);
+    this.bloodStains.push(...b2.bloodUnder);
+
+    // 3) На кухне
+    const b3 = new Body(W*0.72, H*0.72, false);
+    this.bodies.push(b3);
+    this.bloodStains.push(...b3.bloodUnder);
+
+    // Пятна крови на стенах (для губки)
+    this.bloodStains.push(new BloodStain(W*0.5, H*0.5 + 20, 'wall', 40));
+    this.bloodStains.push(new BloodStain(W*0.25, H*0.5 + 30, 'wall', 35));
+    this.bloodStains.push(new BloodStain(W*0.75, H*0.5 - 20, 'wall', 35));
+    // Пятна на полу
+    for(let i=0;i<15;i++){
+      this.bloodStains.push(new BloodStain(rand(100,W-100), rand(100,H-100), 'floor', rand(15,30)));
+    }
+
+    // Крысы
+    for(let i=0;i<5;i++){
+      this.rats.push(new Rat(rand(200,W-200), rand(200,H-200)));
+    }
+  }
+
+  _bindInput(){
+    // Кнопки UI: проверяем тап по инвентарю, кнопке действия
+    this.input.onUIPress = (x,y)=>{
+      const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
+      // Кнопка действия
+      const btnX = W - 90, btnY = H - 130;
+      if(dist2(x,y,btnX,btnY) < 55*55){
+        this._doAction();
+        this.audio.uiClick();
+        return true;
+      }
+      // Инвентарь
+      const tools = ['hands','mop','sponge','phone'];
+      const invY = H - 60;
+      const startX = 20;
+      for(let i=0;i<tools.length;i++){
+        const tx = startX + i*62;
+        if(x >= tx && x <= tx+56 && y >= invY-26 && y <= invY+26){
+          this._selectTool(tools[i]);
+          this.audio.uiClick();
+          return true;
+        }
+      }
+      return false;
+    };
+  }
+
+  _bindKeyboard(){
+    window.addEventListener('keydown', e=>{
+      this.keys.add(e.key);
+      if(e.key === ' '){ this._doAction(); e.preventDefault(); }
+      if(e.key === '1') this._selectTool('hands');
+      if(e.key === '2') this._selectTool('mop');
+      if(e.key === '3') this._selectTool('sponge');
+      if(e.key === '4') this._selectTool('phone');
+      if(e.key === 'Enter' && this.state === 'MENU') this.startGame();
+    });
+    window.addEventListener('keyup', e=>this.keys.delete(e.key));
+  }
+
+  _selectTool(t){
+    const p = this.player;
+    if(t === 'mop' && !p.hasMop){ this.toast('Нет швабры'); return; }
+    if(t === 'sponge' && !p.hasSponge){ this.toast('Нет губки'); return; }
+    if(t === 'phone' && !p.hasPhone){ this.toast('Нет телефона'); return; }
+    p.tool = t;
+    this.toast(`Инструмент: ${({hands:'Руки',mop:'Швабра',sponge:'Губка',phone:'Телефон'})[t]}`);
+  }
+
+  toast(text){
+    this.hud.toast(text);
+  }
+
+  // ---- Контекстное действие ----
+  _doAction(){
+    if(this.state !== 'PLAYING') return;
+    const p = this.player;
+    const px = p.x, py = p.y;
+
+    // 1) Если несёт тело — сдать в выходе
+    if(p.carryingBody){
+      const exit = this.world.exitNear(px,py,80);
+      if(exit){
+        p.carryingBody.state = BodyState.DELIVERED;
+        this.deliveredBodies++;
+        this.toast(`Тело сдано (${this.deliveredBodies})`);
+        p.carryingBody = null;
+        this._saveProgress();
+        return;
+      }
+      // Иначе — выбросить
+      p.carryingBody.state = BodyState.BAGGED;
+      p.carryingBody.x = px + 30;
+      p.carryingBody.y = py;
+      p.carryingBody = null;
+      this.toast('Тело брошено');
+      return;
+    }
+
+    // 2) Действие с инструментом
+    switch(p.tool){
+      case 'hands': {
+        // Взять упакованное тело
+        let nearest = null, nd = 60*60;
+        for(const b of this.bodies){
+          if(b.state === BodyState.BAGGED){
+            const d = dist2(px,py,b.x,b.y);
+            if(d < nd){ nd = d; nearest = b; }
+          }
+        }
+        if(nearest){
+          nearest.state = BodyState.CARRIED;
+          p.carryingBody = nearest;
+          this.toast('Взял тело');
+          return;
+        }
+        // Если рядом тело на поверхности — снять
+        for(const b of this.bodies){
+          if(b.state === BodyState.RAW && b.onSurface && dist2(px,py,b.x,b.y) < 70*70){
+            b.onSurface = false;
+            this.toast('Тело снято с поверхности');
+            return;
+          }
+        }
+        this.toast('Нечего взять');
+        break;
+      }
+      case 'phone': {
+        // Сфотографировать тело
+        let nearest = null, nd = 80*80;
+        for(const b of this.bodies){
+          if(b.state === BodyState.RAW && !b.photoId){
+            const d = dist2(px,py,b.x,b.y);
+            if(d < nd){ nd = d; nearest = b; }
+          }
+        }
+        if(nearest){
+          this.photoCounter++;
+          nearest.photoId = this.photoCounter;
+          nearest.state = BodyState.PHOTOGRAPHED;
+          this.audio.shutter();
+          this.toast(`📷 Жертва #${this.photoCounter} сфотографирована`);
+          this._saveProgress();
+          return;
+        }
+        this.toast('Нет тела рядом');
+        break;
+      }
+      case 'mop': {
+        // Отмыть пятно на полу
+        if(!p.bucket.isWet){ this.toast('Ведро пустое — набери воды'); return; }
+        if(p.bucket.isTooDirty){ this.toast('Вода слишком грязная — смени'); return; }
+        let nearest = null, nd = 45*45;
+        for(const s of this.bloodStains){
+          if(s.type !== 'floor' || s.clean >= 1) continue;
+          const d = dist2(px,py,s.x,s.y);
+          if(d < nd){ nd = d; nearest = s; }
+        }
+        if(nearest){
+          const power = p.bucket.cleanPower;
+          nearest.clean = clamp(nearest.clean + 0.35*power, 0, 1);
+          p.bucket.addDirt(0.04);
+          p.bucket.useWater(0.02);
+          this.audio.mop();
+          if(nearest.clean >= 1){
+            this.toast('Пятно очищено');
+            this._saveProgress();
+          }
+          return;
+        }
+        this.toast('Нет пятен рядом');
+        break;
+      }
+      case 'sponge': {
+        // Мыть стену/потолок
+        if(!p.bucket.isWet){ this.toast('Губка сухая — нужна вода'); return; }
+        if(p.bucket.isTooDirty){ this.toast('Вода слишком грязная'); return; }
+        let nearest = null, nd = 50*50;
+        for(const s of this.bloodStains){
+          if(s.type !== 'wall' || s.clean >= 1) continue;
+          const d = dist2(px,py,s.x,s.y);
+          if(d < nd){ nd = d; nearest = s; }
+        }
+        if(nearest){
+          const power = p.bucket.cleanPower;
+          nearest.clean = clamp(nearest.clean + 0.3*power, 0, 1);
+          p.bucket.addDirt(0.05);
+          p.bucket.useWater(0.03);
+          this.audio.mop();
+          if(nearest.clean >= 1){
+            this.toast('Стена очищена');
+            this._saveProgress();
+          }
+          return;
+        }
+        this.toast('Нет пятен рядом');
+        break;
+      }
+    }
+
+    // 3) Взаимодействие с миром (вода, бутылки, мешки)
+    // Источник воды
+    const ws = this.world.waterSourceNear(px,py,60);
+    if(ws){
+      if(p.bucket.isWet && p.bucket.dirt > 0){
+        p.bucket.empty();
+        this.audio.water();
+        this.toast('Вода слита');
+      } else {
+        p.bucket.fill();
+        this.audio.fillWater();
+        this.toast('💧 Вода набрана');
+      }
+      return;
+    }
+    // Бутылка с моющим средством
+    for(const b of this.world.bottles){
+      if(b.taken) continue;
+      if(dist2(px,py,b.x,b.y) < 50*50){
+        b.taken = true;
+        p.bucket.addSoap();
+        this.audio.uiClick();
+        this.toast('🧴 Добавлено средство');
+        return;
+      }
+    }
+    // Стопка мешков
+    const bs = this.world.bagStack;
+    if(dist2(px,py,bs.x,bs.y) < 60*60){
+      if(bs.count > 0){
+        bs.count--;
+        p.bags++;
+        this.audio.bagRustle();
+        this.toast(`Взял мешок (${p.bags})`);
+      } else {
+        this.toast('Мешки закончились');
+      }
+      return;
+    }
+    this.toast('Действие недоступно');
+  }
+
+  // Обновление контекстной подсказки и метки действия
+  _updateContext(){
+    const p = this.player;
+    const px = p.x, py = p.y;
+    this.actionReady = false;
+    this.actionLabel = 'ДЕЙСТВИЕ';
+    this.contextHint = '';
+
+    if(p.carryingBody){
+      const exit = this.world.exitNear(px,py,80);
+      if(exit){
+        this.actionReady = true;
+        this.actionLabel = 'СДАТЬ';
+        this.contextHint = 'Выход: сдать тело';
+      } else {
+        this.actionReady = true;
+        this.actionLabel = 'БРОСИТЬ';
+      }
+      return;
+    }
+
+    switch(p.tool){
+      case 'hands': {
+        for(const b of this.bodies){
+          if(b.state === BodyState.BAGGED && dist2(px,py,b.x,b.y) < 60*60){
+            this.actionReady = true;
+            this.actionLabel = 'ВЗЯТЬ';
+            this.contextHint = 'Взять тело';
+            return;
+          }
+        }
+        for(const b of this.bodies){
+          if(b.state === BodyState.RAW && b.onSurface && dist2(px,py,b.x,b.y) < 70*70){
+            this.actionReady = true;
+            this.actionLabel = 'СНЯТЬ';
+            this.contextHint = 'Снять тело с поверхности';
+            return;
+          }
+        }
+        const bs = this.world.bagStack;
+        if(dist2(px,py,bs.x,bs.y) < 60*60 && bs.count > 0){
+          this.actionReady = true;
+          this.actionLabel = 'ВЗЯТЬ';
+          this.contextHint = 'Взять мешок';
+          return;
+        }
+        break;
+      }
+      case 'phone': {
+        for(const b of this.bodies){
+          if(b.state === BodyState.RAW && !b.photoId && dist2(px,py,b.x,b.y) < 80*80){
+            this.actionReady = true;
+            this.actionLabel = 'ФОТО';
+            this.contextHint = 'Сфотографировать жертву';
+            return;
+          }
+        }
+        break;
+      }
+      case 'mop': {
+        for(const s of this.bloodStains){
+          if(s.type === 'floor' && s.clean < 1 && dist2(px,py,s.x,s.y) < 45*45){
+            this.actionReady = true;
+            this.actionLabel = 'МЫТЬ';
+            break;
+          }
+        }
+        break;
+      }
+      case 'sponge': {
+        for(const s of this.bloodStains){
+          if(s.type === 'wall' && s.clean < 1 && dist2(px,py,s.x,s.y) < 50*50){
+            this.actionReady = true;
+            this.actionLabel = 'ТЕРЕТЬ';
+            break;
+          }
+        }
+        break;
+      }
+    }
+
+    // Вода/бутылка/мешки
+    const ws = this.world.waterSourceNear(px,py,60);
+    if(ws){
+      this.actionReady = true;
+      this.actionLabel = p.bucket.isWet && p.bucket.dirt > 0 ? 'СЛИТЬ' : 'НАБРАТЬ';
+      this.contextHint = p.bucket.isWet && p.bucket.dirt > 0 ? 'Слить грязную воду' : 'Набрать воды';
+      return;
+    }
+    for(const b of this.world.bottles){
+      if(!b.taken && dist2(px,py,b.x,b.y) < 50*50){
+        this.actionReady = true;
+        this.actionLabel = 'МЫЛО';
+        this.contextHint = 'Добавить моющее средство';
+        return;
+      }
+    }
+  }
+
+  // ---- Обновление ----
+  update(dt){
+    if(this.state !== 'PLAYING') return;
+    const p = this.player;
+    // Время смены
+    this.shiftTime += dt;
+    // Апдейт игрока
+    p.update(dt, this.input, this.world, this);
+    // Крысы
+    for(const r of this.rats) r.update(dt, this.world);
+    // Тела (лёгкая анимация)
+    // ... (можно добавить)
+    // Долгое нажатие — упаковка тела
+    this._updatePacking(dt);
+    // Контекст
+    this._updateContext();
+    // Камера следует за игроком
+    this._updateCamera();
+    // HUD
+    this.hud.update(dt);
+    // Конец смены
+    if(this.shiftTime >= this.shiftDuration){
+      this.state = 'END_OF_SHIFT';
+      this.toast('Смена окончена! Иди в участок.');
+    }
+  }
+
+  _updatePacking(dt){
+    const p = this.player;
+    if(p.tool !== 'hands' || p.carryingBody) { this.packTarget = null; this.packProgress = 0; return; }
+    // Проверяем долгое нажатие на теле
+    let target = null, nd = 55*55;
+    for(const b of this.bodies){
+      if(b.state === BodyState.PHOTOGRAPHED){
+        const d = dist2(p.x,p.y,b.x,b.y);
+        if(d < nd){ nd = d; target = b; }
+      }
+    }
+    if(target && p.bags > 0){
+      // Считаем: если палец зажат на экране (любой) и игрок стоит на месте — прогресс
+      const touching = this.input.touches.size > 0;
+      const stickStill = !this.input.joy.active || (Math.hypot(this.input.joy.dx, this.input.joy.dy) < 0.15);
+      if(touching && stickStill){
+        if(this.packTarget !== target){ this.packTarget = target; this.packProgress = 0; }
+        this.packProgress += dt / 3.0; // 3 секунды
+        if(this.packProgress >= 1){
+          target.state = BodyState.BAGGED;
+          p.bags--;
+          this.audio.bagRustle();
+          this.toast('Тело упаковано в мешок');
+          this.packTarget = null;
+          this.packProgress = 0;
+          this._saveProgress();
+        }
+      } else {
+        this.packTarget = null;
+        this.packProgress = 0;
+      }
+    } else {
+      this.packTarget = null;
+      this.packProgress = 0;
+    }
+  }
+
+  _updateCamera(){
+    const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
+    const p = this.player;
+    const targetX = clamp(p.x - W/2, 0, Math.max(0, this.world.width - W));
+    const targetY = clamp(p.y - H/2, 0, Math.max(0, this.world.height - H));
+    this.camera.x = lerp(this.camera.x, targetX, 0.15);
+    this.camera.y = lerp(this.camera.y, targetY, 0.15);
+  }
+
+  // ---- Отрисовка ----
+  draw(){
+    const ctx = this.ctx;
+    const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
+
+    // Очистка
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fillRect(0,0,W,H);
+
+    ctx.save();
+    ctx.translate(-this.camera.x, -this.camera.y);
+
+    // Полы комнат (разные оттенки)
+    this._drawFloors(ctx);
+
+    // Кровь на полу
+    for(const s of this.bloodStains){
+      if(s.type === 'floor') s.draw(ctx);
+    }
+
+    // Препятствия (мебель, стены)
+    this._drawObstacles(ctx);
+
+    // Источники воды
+    this._drawWaterSources(ctx);
+
+    // Бутылки
+    for(const b of this.world.bottles){
+      if(b.taken) continue;
+      ctx.save();
+      ctx.translate(b.x,b.y);
+      ctx.fillStyle = '#22c55e';
+      ctx.beginPath();
+      ctx.roundRect(-5,-10,10,20,3);
+      ctx.fill();
+      ctx.fillStyle = '#16a34a';
+      ctx.fillRect(-2,-12,4,4);
+      ctx.restore();
+    }
+
+    // Стопка мешков
+    const bs = this.world.bagStack;
+    if(bs.count > 0){
+      ctx.save();
+      ctx.translate(bs.x, bs.y);
+      for(let i=0;i<Math.min(bs.count,5);i++){
+        ctx.fillStyle = i%2 ? '#777' : '#666';
+        ctx.beginPath();
+        ctx.ellipse(i*2, -i*3, 14, 10, 0, 0, Math.PI*2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    // Выход (машина)
+    for(const e of this.world.exits){
+      ctx.save();
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(e.x, e.y, e.w, e.h);
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(e.x, e.y, e.w, e.h);
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('ВЫХОД', e.x+e.w/2, e.y+e.h/2);
+      ctx.restore();
+    }
+
+    // Кровь на стенах
+    for(const s of this.bloodStains){
+      if(s.type === 'wall') s.draw(ctx);
+    }
+
+    // Тела
+    for(const b of this.bodies){
+      if(b.state !== BodyState.CARRIED) b.draw(ctx, this);
+    }
+
+    // Крысы
+    for(const r of this.rats) r.draw(ctx);
+
+    // Игрок
+    this.player.draw(ctx);
+
+    // Несёт тело — уже нарисовано в Player.draw
+
+    ctx.restore();
+
+    // === Освещение / маска видимости ===
+    this._drawLighting(ctx, W, H);
+
+    // === HUD ===
+    this.hud.draw(ctx, W, H, this.input, this);
+
+    // === Меню ===
+    if(this.state === 'MENU'){
+      this._drawMenu(ctx, W, H);
+    } else if(this.state === 'END_OF_SHIFT'){
+      this._drawEndShift(ctx, W, H);
+    }
+  }
+
+  _drawFloors(ctx){
+    const W = this.world.width, H = this.world.height;
+    const midX = W/2, midY = H/2;
+    // 4 комнаты с разными оттенками
+    ctx.fillStyle = '#2a2118'; // спальня
+    ctx.fillRect(0,0,midX,midY);
+    ctx.fillStyle = '#1e2a2a'; // ванная
+    ctx.fillRect(midX,0,W-midX,midY);
+    ctx.fillStyle = '#2a1e1e'; // гостиная
+    ctx.fillRect(0,midY,midX,H-midY);
+    ctx.fillStyle = '#1e1e2a'; // кухня
+    ctx.fillRect(midX,midY,W-midX,H-midY);
+
+    // Текстура — доски/плитка
+    ctx.strokeStyle = 'rgba(255,255,255,0.02)';
+    ctx.lineWidth = 1;
+    for(let x=0;x<W;x+=60){
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke();
+    }
+    for(let y=0;y<H;y+=60){
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
+    }
+  }
+
+  _drawObstacles(ctx){
+    for(const o of this.world.obstacles){
+      // Стены — тёмные, мебель — коричневая
+      const isWall = o.w <= 20 || o.h <= 20 || (o.x===0||o.y===0||o.x+o.w>=this.world.width||o.y+o.h>=this.world.height);
+      ctx.fillStyle = isWall ? '#3a3a3a' : '#5c4a3a';
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+      // Обводка
+      ctx.strokeStyle = isWall ? '#1a1a1a' : '#3a2e22';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(o.x+1, o.y+1, o.w-2, o.h-2);
+      // Блик сверху
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      ctx.fillRect(o.x, o.y, o.w, 3);
+    }
+  }
+
+  _drawWaterSources(ctx){
+    for(const w of this.world.waterSources){
+      ctx.save();
+      ctx.translate(w.x, w.y);
+      if(w.type === 'bath'){
+        ctx.fillStyle = '#e5e7eb';
+        ctx.fillRect(-w.r, -w.r*0.6, w.r*2, w.r*1.2);
+        ctx.fillStyle = '#4a90c8';
+        ctx.fillRect(-w.r+4, -w.r*0.6+4, w.r*2-8, w.r*1.2-8);
+      } else if(w.type === 'sink'){
+        ctx.fillStyle = '#cbd5e1';
+        ctx.beginPath();
+        ctx.ellipse(0,0,w.r,w.r*0.7,0,0,Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = '#4a90c8';
+        ctx.beginPath();
+        ctx.ellipse(0,0,w.r*0.7,w.r*0.5,0,0,Math.PI*2);
+        ctx.fill();
+      } else {
+        ctx.fillStyle = '#e5e7eb';
+        ctx.beginPath();
+        ctx.ellipse(0,0,w.r,w.r*0.7,0,0,Math.PI*2);
+        ctx.fill();
+      }
+      // Капля-индикатор
+      ctx.fillStyle = '#7fd4e8';
+      ctx.beginPath();
+      ctx.arc(0, -w.r-8, 3, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  _drawLighting(ctx, W, H){
+    // Создаём маску тьмы. В светлых зонах — прозрачно, в тёмных — темно.
+    // Светлые зоны: вокруг источников воды, окон, ламп.
+    // Реализация: рисуем тёмный слой, потом "вырезаем" radial gradient вокруг игрока
+    // и вокруг источников света.
+    ctx.save();
+    // Слой тьмы
+    const darkAlpha = 0.55;
+    ctx.fillStyle = `rgba(0,0,0,${darkAlpha})`;
+    ctx.fillRect(0,0,W,H);
+
+    // Используем globalCompositeOperation='destination-out' чтобы вырезать свет
+    ctx.globalCompositeOperation = 'destination-out';
+
+    // Свет вокруг игрока (фонарик)
+    const px = this.player.x - this.camera.x;
+    const py = this.player.y - this.camera.y;
+    const radius = 180;
+    const grad = ctx.createRadialGradient(px, py, 0, px, py, radius);
+    grad.addColorStop(0, 'rgba(0,0,0,1)');
+    grad.addColorStop(0.6, 'rgba(0,0,0,0.7)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(px, py, radius, 0, Math.PI*2);
+    ctx.fill();
+
+    // Свет вокруг источников воды (лампа в ванной, кухне)
+    for(const w of this.world.waterSources){
+      const wx = w.x - this.camera.x, wy = w.y - this.camera.y;
+      const wr = 100;
+      const g2 = ctx.createRadialGradient(wx,wy,0,wx,wy,wr);
+      g2.addColorStop(0, 'rgba(0,0,0,0.9)');
+      g2.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g2;
+      ctx.beginPath();
+      ctx.arc(wx,wy,wr,0,Math.PI*2);
+      ctx.fill();
+    }
+
+    // Свет вокруг выхода
+    for(const e of this.world.exits){
+      const ex = e.x + e.w/2 - this.camera.x;
+      const ey = e.y + e.h/2 - this.camera.y;
+      const g3 = ctx.createRadialGradient(ex,ey,0,ex,ey,120);
+      g3.addColorStop(0, 'rgba(0,0,0,0.9)');
+      g3.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g3;
+      ctx.beginPath();
+      ctx.arc(ex,ey,120,0,Math.PI*2);
+      ctx.fill();
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.restore();
+
+    // Тёплый оттенок фонарика
+    ctx.save();
+    const px2 = this.player.x - this.camera.x;
+    const py2 = this.player.y - this.camera.y;
+    const warm = ctx.createRadialGradient(px2,py2,0,px2,py2,160);
+    warm.addColorStop(0, 'rgba(255,220,140,0.12)');
+    warm.addColorStop(1, 'rgba(255,220,140,0)');
+    ctx.fillStyle = warm;
+    ctx.beginPath();
+    ctx.arc(px2,py2,160,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  _drawMenu(ctx, W, H){
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.85)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#ef4444';
+    ctx.font = 'bold 44px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('УБОРЩИК', W/2, H*0.3);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '16px -apple-system, sans-serif';
+    ctx.fillText('Устрани следы. Замести. Забудь.', W/2, H*0.3 + 40);
+
+    // Кнопка старта
+    const bw = 240, bh = 70;
+    const bx = W/2 - bw/2, by = H*0.55;
+    ctx.fillStyle = '#22c55e';
+    ctx.beginPath();
+    ctx.roundRect(bx, by, bw, bh, 16);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px -apple-system, sans-serif';
+    ctx.fillText('НАЧАТЬ СМЕНУ', W/2, by + bh/2);
+
+    ctx.fillStyle = '#64748b';
+    ctx.font = '13px -apple-system, sans-serif';
+    ctx.fillText('Джойстик слева — движение', W/2, H*0.75);
+    ctx.fillText('Кнопка справа — действие', W/2, H*0.75 + 20);
+    ctx.fillText('Долгое нажатие на теле — упаковка', W/2, H*0.75 + 40);
+    ctx.restore();
+
+    // Проверка тапа по кнопке
+    if(this.input.touches.size > 0){
+      const rect = this.canvas.getBoundingClientRect();
+      for(const [id, t] of this.input.touches){
+        if(t.x >= bx && t.x <= bx+bw && t.y >= by && t.y <= by+bh){
+          this.startGame();
+          this.input.touches.delete(id);
+          break;
+        }
+      }
+    }
+  }
+
+  _drawEndShift(ctx, W, H){
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.85)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#fbbf24';
+    ctx.font = 'bold 32px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('СМЕНА ОКОНЧЕНА', W/2, H*0.25);
+    ctx.fillStyle = '#fff';
+    ctx.font = '18px -apple-system, sans-serif';
+    ctx.fillText(`Жертв сфотографировано: ${this.photoCounter}`, W/2, H*0.35);
+    ctx.fillText(`Тел сдано: ${this.deliveredBodies}`, W/2, H*0.35 + 30);
+    ctx.fillText(`Пятен крови очищено: ${this.bloodStains.filter(s=>s.clean>=1).length}/${this.bloodStains.length}`, W/2, H*0.35 + 60);
+
+    // Кнопка "В участок"
+    const bw = 240, bh = 70;
+    const bx = W/2 - bw/2, by = H*0.6;
+    ctx.fillStyle = '#3b82f6';
+    ctx.beginPath();
+    ctx.roundRect(bx, by, bw, bh, 16);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px -apple-system, sans-serif';
+    ctx.fillText('В УЧАСТОК →', W/2, by + bh/2);
+    ctx.restore();
+
+    if(this.input.touches.size > 0){
+      for(const [id, t] of this.input.touches){
+        if(t.x >= bx && t.x <= bx+bw && t.y >= by && t.y <= by+bh){
+          this.state = 'STATION';
+          this._stationStart();
+          this.input.touches.delete(id);
+          break;
+        }
+      }
+    }
+  }
+
+  // ---- Мини-игра участка ----
+  _stationStart(){
+    this.stationProgress = 0;
+    this.stationTimer = 0;
+    this.stationBodies = this.bodies.filter(b=>b.photoId && b.state !== BodyState.DELIVERED);
+    this.stationIndex = 0;
+  }
+
+  updateStation(dt){
+    this.stationTimer += dt;
+    if(this.stationTimer > 1.5){
+      // Автоудаление по одному
+      this.stationTimer = 0;
+      if(this.stationIndex < this.stationBodies.length){
+        const b = this.stationBodies[this.stationIndex];
+        b.state = BodyState.DELIVERED;
+        this.stationIndex++;
+        this.audio.uiClick();
+        this._saveProgress();
+      }
+    }
+  }
+
+  drawStation(ctx, W, H){
+    ctx.save();
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0,0,W,H);
+
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(20, 100, W-40, H-200);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = 'bold 20px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText('🖥️  СИСТЕМА УЧАСТКА', W/2, 130);
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('УДАЛЕНИЕ ДАННЫХ О ЖЕРТВАХ', W/2, 160);
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#4ade80';
+    ctx.font = '14px monospace';
+    let y = 200;
+    for(let i=0;i<this.stationBodies.length;i++){
+      const b = this.stationBodies[i];
+      const removed = i < this.stationIndex;
+      ctx.fillStyle = removed ? '#4ade80' : '#fbbf24';
+      ctx.fillText(`> Жертва #${b.photoId} ... ${removed ? '[УДАЛЕНО]' : '[УДАЛЕНИЕ...]'}`, 40, y);
+      y += 24;
+    }
+
+    // Прогресс
+    ctx.fillStyle = '#334155';
+    ctx.fillRect(40, H-180, W-80, 12);
+    ctx.fillStyle = '#4ade80';
+    const prog = this.stationBodies.length > 0 ? this.stationIndex / this.stationBodies.length : 1;
+    ctx.fillRect(40, H-180, (W-80)*prog, 12);
+
+    if(this.stationIndex >= this.stationBodies.length && this.stationBodies.length >= 0){
+      ctx.fillStyle = '#4ade80';
+      ctx.font = 'bold 18px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('✓ ДАННЫЕ УДАЛЕНЫ', W/2, H-130);
+      ctx.fillStyle = '#64748b';
+      ctx.font = '14px monospace';
+      ctx.fillText('Тап для выхода в меню', W/2, H-100);
+      if(this.input.touches.size > 0){
+        this.state = 'MENU';
+        this._resetGame();
+        this.input.touches.clear();
+      }
+    }
+    ctx.restore();
+  }
+
+  _resetGame(){
+    this.shiftTime = 0;
+    this.deliveredBodies = 0;
+    this.photoCounter = 0;
+    this.bodies = [];
+    this.rats = [];
+    this.bloodStains = [];
+    this.world = new WorldMap();
+    this.player = new Player(this.world.width/2, this.world.height - 200);
+    this.player.bags = this.world.bagStack.count;
+    this._spawnEntities();
+    this.camera.x = 0; this.camera.y = 0;
+  }
+
+  startGame(){
+    this.audio.init();
+    this.audio.resume();
+    this.state = 'PLAYING';
+    this._resetGame();
+    this.toast('Смена началась. Найди тела и убери следы.');
+  }
+
+  _saveProgress(){
+    try {
+      const data = {
+        photoCounter: this.photoCounter,
+        delivered: this.deliveredBodies,
+        shiftTime: this.shiftTime,
+        stains: this.bloodStains.map(s=>({c:s.clean})),
+      };
+      localStorage.setItem('cleaner_save', JSON.stringify(data));
+    } catch(e){ /* ignore */ }
+  }
+
+  // ---- Resize / DPR ----
+  _resize(){
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    this.canvas.width = Math.floor(w * dpr);
+    this.canvas.height = Math.floor(h * dpr);
+    this.canvas.style.width = w + 'px';
+    this.canvas.style.height = h + 'px';
+    const ctx = this.ctx;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // Сохраняем CSS-размеры для input и HUD
+    this.canvas.clientWidth = w; // на случай отсутствия layout
+    this.canvas.clientHeight = h;
+  }
+
+  // ---- Игровой цикл ----
+  _loop(now){
+    this._raf = requestAnimationFrame(this._loop);
+    let dt = (now - this._lastTime) / 1000;
+    this._lastTime = now;
+    if(dt > 0.1) dt = 0.1; // защита от больших пауз
+    // Фиксированный шаг физики (60 Hz)
+    this._acc += dt;
+    const step = 1/60;
+    let steps = 0;
+    while(this._acc >= step && steps < 5){
+      if(this.state === 'PLAYING') this.update(step);
+      else if(this.state === 'STATION') this.updateStation(step);
+      this._acc -= step;
+      steps++;
+    }
+    // Отрисовка
+    if(this.state === 'STATION'){
+      this.drawStation(this.ctx, this.canvas.clientWidth, this.canvas.clientHeight);
+    } else {
+      this.draw();
+    }
+  }
+}
+
+/* ============================================================
+ *  BOOTSTRAP
+ * ============================================================ */
+const canvas = document.getElementById('game');
+// Полифилл roundRect
+if(!CanvasRenderingContext2D.prototype.roundRect){
+  CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
+    if(typeof r === 'number') r = {tl:r,tr:r,br:r,bl:r};
+    this.beginPath();
+    this.moveTo(x+r.tl, y);
+    this.lineTo(x+w-r.tr, y);
+    this.quadraticCurveTo(x+w, y, x+w, y+r.tr);
+    this.lineTo(x+w, y+h-r.br);
+    this.quadraticCurveTo(x+w, y+h, x+w-r.br, y+h);
+    this.lineTo(x+r.bl, y+h);
+    this.quadraticCurveTo(x, y+h, x, y+h-r.bl);
+    this.lineTo(x, y+r.tl);
+    this.quadraticCurveTo(x, y, x+r.tl, y);
+    this.closePath();
+    return this;
+  };
+}
+
+const game = new Game(canvas);
+window.__game = game; // для отладки
+
+// Регистрация service worker (если доступен)
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('sw.js').catch(()=>{
+      // Если sw.js недоступен — тихо игнорируем
+    });
+  });
+}
+</script>
+</body>
+</html>
